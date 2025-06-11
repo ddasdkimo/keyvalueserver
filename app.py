@@ -9,6 +9,8 @@ from datetime import datetime
 import time
 from functools import wraps
 import threading
+from collections import defaultdict
+import hashlib
 
 app = Flask(__name__)
 
@@ -112,21 +114,25 @@ health_model = api.model('Health', {
     'redis_connected': fields.Boolean(description='Redis 連線狀態')
 })
 
-# Redis 連線設定
+# Redis 連線設定 - 優化連接池配置
 redis_host = os.getenv('REDIS_HOST', 'localhost')
 redis_port = int(os.getenv('REDIS_PORT', 6379))
 redis_password = os.getenv('REDIS_PASSWORD', None)
 
-# 創建 Redis 連接池以提高併發性能
+# 創建 Redis 連接池以提高併發性能 - 優化配置
 redis_pool = redis.ConnectionPool(
     host=redis_host,
     port=redis_port,
     password=redis_password,
     decode_responses=True,
-    max_connections=100,  # 最大連接數
+    max_connections=200,  # 增加最大連接數
     retry_on_timeout=True,
-    socket_connect_timeout=5,
-    socket_timeout=5
+    socket_connect_timeout=3,  # 減少連接超時
+    socket_timeout=3,  # 減少操作超時
+    retry_on_error=[redis.BusyLoadingError, redis.ConnectionError],
+    socket_keepalive=True,
+    socket_keepalive_options={},
+    health_check_interval=30  # 健康檢查間隔
 )
 
 try:
@@ -138,39 +144,199 @@ except redis.ConnectionError:
     print(f"❌ 無法連接到 Redis: {redis_host}:{redis_port}")
     r = None
 
-# 本地緩存以減少 Redis 查詢
-local_cache = {}
-cache_lock = threading.RLock()
-CACHE_TTL = 30  # 緩存 30 秒
+# 改進的本地緩存系統
+class OptimizedCache:
+    def __init__(self, max_size=1000, default_ttl=30):
+        self.cache = {}
+        self.access_times = {}
+        self.max_size = max_size
+        self.default_ttl = default_ttl
+        self.lock = threading.RLock()
+        
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                data, timestamp = self.cache[key]
+                if time.time() - timestamp < self.default_ttl:
+                    self.access_times[key] = time.time()
+                    return data
+                else:
+                    # 清理過期數據
+                    del self.cache[key]
+                    if key in self.access_times:
+                        del self.access_times[key]
+            return None
+    
+    def set(self, key, value):
+        with self.lock:
+            current_time = time.time()
+            
+            # 如果緩存已滿，移除最久未使用的項目
+            if len(self.cache) >= self.max_size and key not in self.cache:
+                self._evict_lru()
+            
+            self.cache[key] = (value, current_time)
+            self.access_times[key] = current_time
+    
+    def _evict_lru(self):
+        if not self.access_times:
+            return
+        
+        # 找到最久未使用的 key
+        lru_key = min(self.access_times.items(), key=lambda x: x[1])[0]
+        del self.cache[lru_key]
+        del self.access_times[lru_key]
+    
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
+            self.access_times.clear()
 
-def cache_decorator(ttl=CACHE_TTL):
-    """簡單的本地緩存裝飾器"""
+# 全局優化緩存實例
+optimized_cache = OptimizedCache(max_size=2000, default_ttl=60)
+
+# 索引系統 - 加速查詢
+class RecordIndex:
+    def __init__(self):
+        self.key_index = defaultdict(set)  # key -> set of record_ids
+        self.type_index = defaultdict(set)  # type -> set of record_ids
+        self.key_type_index = {}  # (key, type) -> record_id
+        self.lock = threading.RLock()
+        self.dirty = True
+    
+    def rebuild_index(self):
+        """重建索引"""
+        with self.lock:
+            if not self.dirty:
+                return
+            
+            self.key_index.clear()
+            self.type_index.clear()
+            self.key_type_index.clear()
+            
+            if r is None:
+                return
+            
+            try:
+                # 使用 pipeline 批次獲取所有記錄
+                pipe = r.pipeline()
+                all_keys = r.keys('record:*')
+                
+                if not all_keys:
+                    self.dirty = False
+                    return
+                
+                for redis_key in all_keys:
+                    pipe.get(redis_key)
+                
+                values = pipe.execute()
+                
+                for redis_key, value in zip(all_keys, values):
+                    if value:
+                        try:
+                            record = json.loads(value)
+                            if (isinstance(record, dict) and 
+                                'key' in record and 'type' in record):
+                                
+                                record_id = redis_key.replace('record:', '')
+                                key = record['key']
+                                type_val = record['type']
+                                
+                                self.key_index[key].add(record_id)
+                                self.type_index[type_val].add(record_id)
+                                self.key_type_index[(key, type_val)] = record_id
+                        except (json.JSONDecodeError, Exception):
+                            continue
+                
+                self.dirty = False
+            except Exception as e:
+                print(f"索引重建失敗: {e}")
+    
+    def get_by_key(self, key):
+        """根據 key 獲取記錄 ID"""
+        with self.lock:
+            if self.dirty:
+                self.rebuild_index()
+            return list(self.key_index.get(key, []))
+    
+    def get_by_type(self, type_val):
+        """根據 type 獲取記錄 ID"""
+        with self.lock:
+            if self.dirty:
+                self.rebuild_index()
+            return list(self.type_index.get(type_val, []))
+    
+    def get_by_key_type(self, key, type_val):
+        """根據 key-type 組合獲取記錄 ID"""
+        with self.lock:
+            if self.dirty:
+                self.rebuild_index()
+            return self.key_type_index.get((key, type_val))
+    
+    def mark_dirty(self):
+        """標記索引需要更新"""
+        with self.lock:
+            self.dirty = True
+
+# 全局索引實例
+record_index = RecordIndex()
+
+def optimized_cache_decorator(ttl=60):
+    """優化的緩存裝飾器"""
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
             # 生成緩存鍵
-            cache_key = f"{func.__name__}:{str(args)}:{str(sorted(kwargs.items()))}"
-            current_time = time.time()
+            cache_key_data = f"{func.__name__}:{str(args)}:{str(sorted(kwargs.items()))}"
+            cache_key = hashlib.md5(cache_key_data.encode()).hexdigest()
             
-            with cache_lock:
-                if cache_key in local_cache:
-                    cached_data, cached_time = local_cache[cache_key]
-                    if current_time - cached_time < ttl:
-                        return cached_data
-                
-                # 執行函數並緩存結果
-                result = func(*args, **kwargs)
-                local_cache[cache_key] = (result, current_time)
-                
-                # 清理過期緩存
-                expired_keys = [k for k, (_, t) in local_cache.items() 
-                              if current_time - t > ttl]
-                for k in expired_keys:
-                    del local_cache[k]
-                
-                return result
+            # 嘗試從緩存獲取
+            cached_result = optimized_cache.get(cache_key)
+            if cached_result is not None:
+                return cached_result
+            
+            # 執行函數並緩存結果
+            result = func(*args, **kwargs)
+            optimized_cache.set(cache_key, result)
+            
+            return result
         return wrapper
     return decorator
+
+def get_records_by_ids(record_ids):
+    """批次獲取記錄"""
+    if not record_ids or r is None:
+        return []
+    
+    try:
+        # 使用 pipeline 批次獲取
+        pipe = r.pipeline()
+        redis_keys = [f'record:{rid}' for rid in record_ids]
+        
+        for redis_key in redis_keys:
+            pipe.get(redis_key)
+        
+        values = pipe.execute()
+        
+        records = []
+        for redis_key, value in zip(redis_keys, values):
+            if value:
+                try:
+                    record = json.loads(value)
+                    if isinstance(record, dict):
+                        # 確保必要欄位存在
+                        if 'updated_at' not in record:
+                            record['updated_at'] = 'N/A'
+                        if 'id' not in record:
+                            record['id'] = redis_key.replace('record:', '')
+                        records.append(record)
+                except (json.JSONDecodeError, Exception):
+                    continue
+        
+        return records
+    except Exception as e:
+        print(f"批次獲取記錄失敗: {e}")
+        return []
 
 @ns_health.route('/')
 class HealthCheck(Resource):
@@ -192,7 +358,7 @@ class SetRecord(Resource):
     @ns_records.response(400, 'Bad Request', error_model)
     @ns_records.response(500, 'Internal Server Error', error_model)
     def post(self):
-        """建立新記錄或更新現有記錄"""
+        """建立新記錄或更新現有記錄 - 優化版本"""
         try:
             data = request.get_json()
             if not data or 'key' not in data or 'type' not in data or 'value' not in data:
@@ -212,65 +378,60 @@ class SetRecord(Resource):
             if r is None:
                 api.abort(500, 'Redis 連線失敗')
             
-            # 取得當前時間
             current_time = datetime.now().isoformat()
             
-            # 檢查是否已存在相同的 key-type 組合
-            all_keys = r.keys('record:*')
-            existing_record_id = None
-            
-            for redis_key in all_keys:
-                try:
-                    stored_data = r.get(redis_key)
-                    if stored_data:
-                        record = json.loads(stored_data)
-                        if (record.get('key') == key and 
-                            record.get('type') == type_value):
-                            existing_record_id = redis_key
-                            break
-                except (json.JSONDecodeError, Exception):
-                    continue
+            # 使用索引快速查找現有記錄
+            existing_record_id = record_index.get_by_key_type(key, type_value)
             
             if existing_record_id:
-                # 更新現有記錄的 value
-                stored_data = r.get(existing_record_id)
-                record = json.loads(stored_data)
-                record['value'] = value
-                record['updated_at'] = current_time
-                
-                r.set(existing_record_id, json.dumps(record, ensure_ascii=False))
-                
-                return {
-                    'message': f'成功更新記錄 (key: {key}, type: {type_value}, value: {value})',
-                    'id': existing_record_id.replace('record:', ''),
-                    'key': key,
-                    'type': type_value,
-                    'value': value,
-                    'updated_at': current_time
-                }
-            else:
-                # 建立新記錄
-                record_id = str(uuid.uuid4())
-                redis_key = f'record:{record_id}'
-                
-                record = {
-                    'id': record_id,
-                    'key': key,
-                    'type': type_value,
-                    'value': value,
-                    'updated_at': current_time
-                }
-                
-                r.set(redis_key, json.dumps(record, ensure_ascii=False))
-                
-                return {
-                    'message': f'成功建立新記錄 (key: {key}, value: {value})',
-                    'id': record_id,
-                    'key': key,
-                    'type': type_value,
-                    'value': value,
-                    'updated_at': current_time
-                }
+                # 更新現有記錄
+                redis_key = f'record:{existing_record_id}'
+                stored_data = r.get(redis_key)
+                if stored_data:
+                    record = json.loads(stored_data)
+                    record['value'] = value
+                    record['updated_at'] = current_time
+                    
+                    r.set(redis_key, json.dumps(record, ensure_ascii=False))
+                    
+                    # 清理相關緩存
+                    optimized_cache.clear()
+                    
+                    return {
+                        'message': f'成功更新記錄 (key: {key}, type: {type_value}, value: {value})',
+                        'id': existing_record_id,
+                        'key': key,
+                        'type': type_value,
+                        'value': value,
+                        'updated_at': current_time
+                    }
+            
+            # 建立新記錄
+            record_id = str(uuid.uuid4())
+            redis_key = f'record:{record_id}'
+            
+            record = {
+                'id': record_id,
+                'key': key,
+                'type': type_value,
+                'value': value,
+                'updated_at': current_time
+            }
+            
+            r.set(redis_key, json.dumps(record, ensure_ascii=False))
+            
+            # 標記索引需要更新
+            record_index.mark_dirty()
+            optimized_cache.clear()
+            
+            return {
+                'message': f'成功建立新記錄 (key: {key}, value: {value})',
+                'id': record_id,
+                'key': key,
+                'type': type_value,
+                'value': value,
+                'updated_at': current_time
+            }
         
         except Exception as e:
             api.abort(500, str(e))
@@ -281,39 +442,28 @@ class GetRecord(Resource):
     @ns_records.marshal_with(records_list_model, code=200)
     @ns_records.response(404, 'Not Found', error_model)
     @ns_records.response(500, 'Internal Server Error', error_model)
+    @optimized_cache_decorator(ttl=30)
     def get(self, key):
-        """取得指定 key 的所有記錄"""
+        """取得指定 key 的所有記錄 - 優化版本"""
         try:
             if r is None:
                 api.abort(500, 'Redis 連線失敗')
             
-            # 搜尋所有記錄
-            all_keys = r.keys('record:*')
-            matching_records = []
+            # 使用索引快速查找
+            record_ids = record_index.get_by_key(key)
             
-            for redis_key in all_keys:
-                try:
-                    value = r.get(redis_key)
-                    if value:
-                        record = json.loads(value)
-                        if (isinstance(record, dict) and 
-                            'key' in record and 'type' in record and 'value' in record and
-                            record['key'] == key):
-                            # 如果舊記錄沒有 updated_at，加入預設值
-                            if 'updated_at' not in record:
-                                record['updated_at'] = 'N/A'
-                            if 'id' not in record:
-                                record['id'] = redis_key.replace('record:', '')
-                            matching_records.append(record)
-                except (json.JSONDecodeError, Exception):
-                    continue
+            if not record_ids:
+                api.abort(404, f'找不到 key: {key}')
             
-            if not matching_records:
+            # 批次獲取記錄
+            records = get_records_by_ids(record_ids)
+            
+            if not records:
                 api.abort(404, f'找不到 key: {key}')
             
             return {
-                'records': matching_records,
-                'count': len(matching_records)
+                'records': records,
+                'count': len(records)
             }
         
         except Exception as e:
@@ -326,54 +476,29 @@ class DeleteRecord(Resource):
     @ns_records.response(404, 'Not Found', error_model)
     @ns_records.response(500, 'Internal Server Error', error_model)
     def delete(self, key):
-        """刪除指定 key 的所有記錄"""
+        """刪除指定 key 的所有記錄 - 優化版本"""
         try:
             if r is None:
                 api.abort(500, 'Redis 連線失敗')
             
-            # 搜尋所有符合 key 的記錄
-            all_keys = r.keys('record:*')
-            deleted_count = 0
+            # 使用索引快速查找
+            record_ids = record_index.get_by_key(key)
             
-            for redis_key in all_keys:
-                try:
-                    value = r.get(redis_key)
-                    if value:
-                        record = json.loads(value)
-                        if (isinstance(record, dict) and 
-                            'key' in record and 
-                            record['key'] == key):
-                            r.delete(redis_key)
-                            deleted_count += 1
-                except (json.JSONDecodeError, Exception):
-                    continue
+            if not record_ids:
+                api.abort(404, f'找不到 key: {key}')
+            
+            # 批次刪除
+            redis_keys = [f'record:{rid}' for rid in record_ids]
+            deleted_count = r.delete(*redis_keys)
             
             if deleted_count == 0:
                 api.abort(404, f'找不到 key: {key}')
             
+            # 更新索引和緩存
+            record_index.mark_dirty()
+            optimized_cache.clear()
+            
             return {'message': f'成功刪除 {deleted_count} 筆記錄 (key: {key})'}
-        
-        except Exception as e:
-            api.abort(500, str(e))
-
-@ns_records.route('/delete/id/<string:record_id>')
-class DeleteRecordById(Resource):
-    @ns_records.doc('delete_record_by_id')
-    @ns_records.response(200, 'Success')
-    @ns_records.response(404, 'Not Found', error_model)
-    @ns_records.response(500, 'Internal Server Error', error_model)
-    def delete(self, record_id):
-        """根據內部 ID 刪除指定記錄"""
-        try:
-            if r is None:
-                api.abort(500, 'Redis 連線失敗')
-            
-            redis_key = f'record:{record_id}'
-            result = r.delete(redis_key)
-            if result == 0:
-                api.abort(404, f'找不到 ID: {record_id}')
-            
-            return {'message': f'成功刪除記錄 ID: {record_id}'}
         
         except Exception as e:
             api.abort(500, str(e))
@@ -449,41 +574,36 @@ class GetRecordsByType(Resource):
     @ns_query.marshal_with(type_filtered_model, code=200)
     @ns_query.response(500, 'Internal Server Error', error_model)
     @ns_query.param('pattern', '搜尋模式 (預設: *)', type=str, default='*')
+    @optimized_cache_decorator(ttl=60)
     def get(self, type_filter):
-        """根據 type 篩選記錄"""
+        """根據 type 篩選記錄 - 優化版本"""
         try:
             if r is None:
                 api.abort(500, 'Redis 連線失敗')
             
             pattern = request.args.get('pattern', '*')
-            keys = r.keys('record:*')
             
-            # 篩選符合 type 的記錄
-            filtered_records = []
-            for redis_key in keys:
-                try:
-                    value = r.get(redis_key)
-                    if value:
-                        record = json.loads(value)
-                        if (isinstance(record, dict) and 
-                            'key' in record and 'type' in record and 'value' in record and
-                            record['type'] == type_filter):
-                            # 如果舊記錄沒有 updated_at，加入預設值
-                            if 'updated_at' not in record:
-                                record['updated_at'] = 'N/A'
-                            if 'id' not in record:
-                                record['id'] = redis_key.replace('record:', '')
-                            
-                            # 根據 pattern 篩選 key
-                            if pattern == '*' or self._match_pattern(record['key'], pattern):
-                                filtered_records.append(record)
-                except (json.JSONDecodeError, Exception):
-                    continue
+            # 使用索引快速查找
+            record_ids = record_index.get_by_type(type_filter)
+            
+            if not record_ids:
+                return {
+                    'type': type_filter,
+                    'records': [],
+                    'count': 0
+                }
+            
+            # 批次獲取記錄
+            records = get_records_by_ids(record_ids)
+            
+            # 根據 pattern 篩選
+            if pattern != '*':
+                records = [r for r in records if self._match_pattern(r.get('key', ''), pattern)]
             
             return {
                 'type': type_filter,
-                'records': filtered_records, 
-                'count': len(filtered_records)
+                'records': records,
+                'count': len(records)
             }
         
         except Exception as e:
@@ -524,7 +644,7 @@ class BatchSetRecords(Resource):
     @ns_records.response(400, 'Bad Request', error_model)
     @ns_records.response(500, 'Internal Server Error', error_model)
     def post(self):
-        """批次建立或更新多筆記錄"""
+        """批次建立或更新多筆記錄 - 優化版本"""
         try:
             data = request.get_json()
             if not data or 'records' not in data:
@@ -542,6 +662,10 @@ class BatchSetRecords(Resource):
             successful_count = 0
             failed_count = 0
             current_time = datetime.now().isoformat()
+            
+            # 使用 pipeline 進行批次操作
+            pipe = r.pipeline()
+            operations = []
             
             for i, record_data in enumerate(records):
                 try:
@@ -571,39 +695,22 @@ class BatchSetRecords(Resource):
                         failed_count += 1
                         continue
                     
-                    # 檢查是否已存在相同的 key-type 組合
-                    all_keys = r.keys('record:*')
-                    existing_record_id = None
-                    
-                    for redis_key in all_keys:
-                        try:
-                            stored_data = r.get(redis_key)
-                            if stored_data:
-                                record = json.loads(stored_data)
-                                if (record.get('key') == key and 
-                                    record.get('type') == type_value):
-                                    existing_record_id = redis_key
-                                    break
-                        except (json.JSONDecodeError, Exception):
-                            continue
+                    # 檢查是否已存在
+                    existing_record_id = record_index.get_by_key_type(key, type_value)
                     
                     if existing_record_id:
                         # 更新現有記錄
-                        stored_data = r.get(existing_record_id)
-                        record = json.loads(stored_data)
-                        record['value'] = value
-                        record['updated_at'] = current_time
-                        
-                        r.set(existing_record_id, json.dumps(record, ensure_ascii=False))
-                        
-                        results.append({
-                            'message': f'更新記錄 (key: {key}, type: {type_value})',
-                            'id': existing_record_id.replace('record:', ''),
+                        redis_key = f'record:{existing_record_id}'
+                        record = {
+                            'id': existing_record_id,
                             'key': key,
                             'type': type_value,
                             'value': value,
                             'updated_at': current_time
-                        })
+                        }
+                        
+                        pipe.set(redis_key, json.dumps(record, ensure_ascii=False))
+                        operations.append(('update', i, existing_record_id, key, type_value, value))
                     else:
                         # 建立新記錄
                         record_id = str(uuid.uuid4())
@@ -617,8 +724,29 @@ class BatchSetRecords(Resource):
                             'updated_at': current_time
                         }
                         
-                        r.set(redis_key, json.dumps(record, ensure_ascii=False))
-                        
+                        pipe.set(redis_key, json.dumps(record, ensure_ascii=False))
+                        operations.append(('create', i, record_id, key, type_value, value))
+                    
+                except Exception as e:
+                    errors.append(f'記錄 {i+1}: {str(e)}')
+                    failed_count += 1
+            
+            # 執行批次操作
+            try:
+                pipe.execute()
+                
+                # 處理結果
+                for op_type, index, record_id, key, type_value, value in operations:
+                    if op_type == 'update':
+                        results.append({
+                            'message': f'更新記錄 (key: {key}, type: {type_value})',
+                            'id': record_id,
+                            'key': key,
+                            'type': type_value,
+                            'value': value,
+                            'updated_at': current_time
+                        })
+                    else:  # create
                         results.append({
                             'message': f'建立新記錄 (key: {key})',
                             'id': record_id,
@@ -627,12 +755,16 @@ class BatchSetRecords(Resource):
                             'value': value,
                             'updated_at': current_time
                         })
-                    
                     successful_count += 1
-                    
-                except Exception as e:
-                    errors.append(f'記錄 {i+1}: {str(e)}')
-                    failed_count += 1
+                
+                # 更新索引和緩存
+                record_index.mark_dirty()
+                optimized_cache.clear()
+                
+            except Exception as e:
+                # 如果批次操作失敗，記錄錯誤
+                errors.append(f'批次操作失敗: {str(e)}')
+                failed_count += len(operations)
             
             return {
                 'message': f'批次處理完成：成功 {successful_count} 筆，失敗 {failed_count} 筆',
