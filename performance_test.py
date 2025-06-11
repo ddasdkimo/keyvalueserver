@@ -12,7 +12,7 @@ import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 設定
-BASE_URL = "http://localhost:5001"
+BASE_URL = "http://localhost:35001"
 API_BASE = f"{BASE_URL}/api/v1"
 
 class PerformanceTest:

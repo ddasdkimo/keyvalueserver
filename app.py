@@ -15,11 +15,30 @@ app = Flask(__name__)
 # 配置 Swagger
 api = Api(
     app,
-    version='1.0',
+    version='2.0',
     title='Key-Value-Type Server API',
-    description='一個使用 Redis 的結構化 Key-Value-Type 儲存服務',
+    description='''
+    一個高效能的 Redis 結構化 Key-Value-Type 儲存服務
+    
+    ## 功能特色：
+    - ✅ 支援單筆與批次操作
+    - ✅ 結構化資料儲存 (key-type-value)
+    - ✅ 完整的 REST API
+    - ✅ 自動去重與更新機制
+    - ✅ 模式搜尋與類型篩選
+    - ✅ 高併發與緩存優化
+    
+    ## 批次操作：
+    - **批次寫入**: POST /api/v1/records/batch/set
+    - **批次查詢**: POST /api/v1/records/batch/get
+    
+    ## 向後相容：
+    所有端點都提供根路由的向後相容支援
+    ''',
     doc='/swagger/',
-    prefix='/api/v1'
+    prefix='/api/v1',
+    contact='API Support',
+    contact_email='support@example.com'
 )
 
 # 建立命名空間
@@ -64,6 +83,23 @@ type_filtered_model = api.model('TypeFilteredRecords', {
     'type': fields.String(description='篩選的類型'),
     'records': fields.List(fields.Nested(record_output_model), description='符合類型的記錄'),
     'count': fields.Integer(description='符合記錄總數')
+})
+
+# 批次操作模型
+batch_input_model = api.model('BatchInput', {
+    'records': fields.List(fields.Nested(record_input_model), required=True, description='批次記錄列表')
+})
+
+batch_get_input_model = api.model('BatchGetInput', {
+    'keys': fields.List(fields.String, required=True, description='要查詢的 key 列表', example=['temperature_sensor_01', 'humidity_sensor_02'])
+})
+
+batch_response_model = api.model('BatchResponse', {
+    'message': fields.String(description='批次操作結果訊息'),
+    'successful_count': fields.Integer(description='成功處理的記錄數量'),
+    'failed_count': fields.Integer(description='失敗的記錄數量'),
+    'results': fields.List(fields.Nested(success_response_model), description='成功處理的記錄詳情'),
+    'errors': fields.List(fields.String, description='錯誤訊息列表')
 })
 
 error_model = api.model('Error', {
@@ -480,6 +516,185 @@ class FlushAllRecords(Resource):
         except Exception as e:
             api.abort(500, str(e))
 
+@ns_records.route('/batch/set')
+class BatchSetRecords(Resource):
+    @ns_records.doc('batch_set_records')
+    @ns_records.expect(batch_input_model)
+    @ns_records.marshal_with(batch_response_model, code=200)
+    @ns_records.response(400, 'Bad Request', error_model)
+    @ns_records.response(500, 'Internal Server Error', error_model)
+    def post(self):
+        """批次建立或更新多筆記錄"""
+        try:
+            data = request.get_json()
+            if not data or 'records' not in data:
+                api.abort(400, '需要提供 records 陣列')
+            
+            records = data['records']
+            if not isinstance(records, list) or len(records) == 0:
+                api.abort(400, 'records 必須是非空陣列')
+            
+            if r is None:
+                api.abort(500, 'Redis 連線失敗')
+            
+            results = []
+            errors = []
+            successful_count = 0
+            failed_count = 0
+            current_time = datetime.now().isoformat()
+            
+            for i, record_data in enumerate(records):
+                try:
+                    # 驗證單筆記錄
+                    if not isinstance(record_data, dict):
+                        errors.append(f'記錄 {i+1}: 資料格式錯誤')
+                        failed_count += 1
+                        continue
+                    
+                    if 'key' not in record_data or 'type' not in record_data or 'value' not in record_data:
+                        errors.append(f'記錄 {i+1}: 缺少必要欄位 (key, type, value)')
+                        failed_count += 1
+                        continue
+                    
+                    key = record_data['key']
+                    type_value = record_data['type']
+                    value = record_data['value']
+                    
+                    # 驗證參數類型
+                    if not isinstance(type_value, str):
+                        errors.append(f'記錄 {i+1}: type 必須是字串')
+                        failed_count += 1
+                        continue
+                    
+                    if not isinstance(value, (int, float)):
+                        errors.append(f'記錄 {i+1}: value 必須是數字')
+                        failed_count += 1
+                        continue
+                    
+                    # 檢查是否已存在相同的 key-type 組合
+                    all_keys = r.keys('record:*')
+                    existing_record_id = None
+                    
+                    for redis_key in all_keys:
+                        try:
+                            stored_data = r.get(redis_key)
+                            if stored_data:
+                                record = json.loads(stored_data)
+                                if (record.get('key') == key and 
+                                    record.get('type') == type_value):
+                                    existing_record_id = redis_key
+                                    break
+                        except (json.JSONDecodeError, Exception):
+                            continue
+                    
+                    if existing_record_id:
+                        # 更新現有記錄
+                        stored_data = r.get(existing_record_id)
+                        record = json.loads(stored_data)
+                        record['value'] = value
+                        record['updated_at'] = current_time
+                        
+                        r.set(existing_record_id, json.dumps(record, ensure_ascii=False))
+                        
+                        results.append({
+                            'message': f'更新記錄 (key: {key}, type: {type_value})',
+                            'id': existing_record_id.replace('record:', ''),
+                            'key': key,
+                            'type': type_value,
+                            'value': value,
+                            'updated_at': current_time
+                        })
+                    else:
+                        # 建立新記錄
+                        record_id = str(uuid.uuid4())
+                        redis_key = f'record:{record_id}'
+                        
+                        record = {
+                            'id': record_id,
+                            'key': key,
+                            'type': type_value,
+                            'value': value,
+                            'updated_at': current_time
+                        }
+                        
+                        r.set(redis_key, json.dumps(record, ensure_ascii=False))
+                        
+                        results.append({
+                            'message': f'建立新記錄 (key: {key})',
+                            'id': record_id,
+                            'key': key,
+                            'type': type_value,
+                            'value': value,
+                            'updated_at': current_time
+                        })
+                    
+                    successful_count += 1
+                    
+                except Exception as e:
+                    errors.append(f'記錄 {i+1}: {str(e)}')
+                    failed_count += 1
+            
+            return {
+                'message': f'批次處理完成：成功 {successful_count} 筆，失敗 {failed_count} 筆',
+                'successful_count': successful_count,
+                'failed_count': failed_count,
+                'results': results,
+                'errors': errors
+            }
+        
+        except Exception as e:
+            api.abort(500, str(e))
+
+@ns_records.route('/batch/get')
+class BatchGetRecords(Resource):
+    @ns_records.doc('batch_get_records')
+    @ns_records.expect(batch_get_input_model)
+    @ns_records.marshal_with(records_list_model, code=200)
+    @ns_records.response(400, 'Bad Request', error_model)
+    @ns_records.response(500, 'Internal Server Error', error_model)
+    def post(self):
+        """批次取得多個 key 的記錄"""
+        try:
+            data = request.get_json()
+            if not data or 'keys' not in data:
+                api.abort(400, '需要提供 keys 陣列')
+            
+            keys = data['keys']
+            if not isinstance(keys, list) or len(keys) == 0:
+                api.abort(400, 'keys 必須是非空陣列')
+            
+            if r is None:
+                api.abort(500, 'Redis 連線失敗')
+            
+            # 搜尋所有記錄
+            all_redis_keys = r.keys('record:*')
+            matching_records = []
+            
+            for redis_key in all_redis_keys:
+                try:
+                    value = r.get(redis_key)
+                    if value:
+                        record = json.loads(value)
+                        if (isinstance(record, dict) and 
+                            'key' in record and 'type' in record and 'value' in record and
+                            record['key'] in keys):
+                            # 如果舊記錄沒有必要欄位，加入預設值
+                            if 'updated_at' not in record:
+                                record['updated_at'] = 'N/A'
+                            if 'id' not in record:
+                                record['id'] = redis_key.replace('record:', '')
+                            matching_records.append(record)
+                except (json.JSONDecodeError, Exception):
+                    continue
+            
+            return {
+                'records': matching_records,
+                'count': len(matching_records)
+            }
+        
+        except Exception as e:
+            api.abort(500, str(e))
+
 # 為了向後兼容，保留一些根路由
 @app.route('/', methods=['GET'])
 def root_health_check():
@@ -530,6 +745,22 @@ def root_keys_by_type(type_filter):
 def root_flush():
     """根路由清空資料（向後兼容）"""
     response = app.test_client().post('/api/v1/records/flush')
+    return response.get_json(), response.status_code
+
+@app.route('/batch/set', methods=['POST'])
+def root_batch_set():
+    """根路由批次設定記錄（向後兼容）"""
+    response = app.test_client().post('/api/v1/records/batch/set', 
+                                     json=request.get_json(),
+                                     headers={'Content-Type': 'application/json'})
+    return response.get_json(), response.status_code
+
+@app.route('/batch/get', methods=['POST'])
+def root_batch_get():
+    """根路由批次取得記錄（向後兼容）"""
+    response = app.test_client().post('/api/v1/records/batch/get',
+                                     json=request.get_json(),
+                                     headers={'Content-Type': 'application/json'})
     return response.get_json(), response.status_code
 
 if __name__ == '__main__':

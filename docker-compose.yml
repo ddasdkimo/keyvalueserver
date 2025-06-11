@@ -4,8 +4,8 @@ services:
   redis:
     image: redis:7-alpine
     container_name: redis-server
-    ports:
-      - "6379:6379"
+    # ports:
+    #   - "6379:6379"
     volumes:
       - redis_data:/data
     command: |
@@ -24,7 +24,7 @@ services:
     build: .
     container_name: flask-api
     ports:
-      - "5001:5000"
+      - "35001:5000"
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
@@ -39,10 +39,11 @@ services:
       - app-network
     # 使用 Gunicorn 作為 WSGI 服務器
     command: gunicorn --config gunicorn.conf.py app_optimized:app
+    # command: sleep 1000000000
     deploy:
       resources:
         limits:
-          memory: 1GB
+          memory: 5GB
         reservations:
           memory: 512MB
 volumes:
