@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis-server
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: |
+      redis-server --appendonly yes
+                   --maxmemory 512mb
+                   --maxmemory-policy allkeys-lru
+                   --tcp-keepalive 60
+                   --timeout 300
+    restart: unless-stopped
+    networks:
+      - app-network
+    sysctls:
+      - net.core.somaxconn=65535
+
+  flask-api:
+    build: .
+    container_name: flask-api
+    ports:
+      - "5001:5000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - FLASK_ENV=production
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - redis
+    volumes:
+      - .:/app
+    restart: unless-stopped
+    networks:
+      - app-network
+    # 使用 Gunicorn 作為 WSGI 服務器
+    command: gunicorn --config gunicorn.conf.py app_optimized:app
+    deploy:
+      resources:
+        limits:
+          memory: 1GB
+        reservations:
+          memory: 512MB
+volumes:
+  redis_data:
+
+networks:
+  app-network:
+    driver: bridge
