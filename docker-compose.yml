@@ -38,7 +38,7 @@ services:
     networks:
       - app-network
     # 使用 Gunicorn 作為 WSGI 服務器
-    command: gunicorn --config gunicorn.conf.py app_optimized:app
+    command: gunicorn --config gunicorn.conf.py app:app
     # command: sleep 1000000000
     deploy:
       resources:
